@@ -1,9 +1,8 @@
 const fetch = require('node-fetch').default;
 const express = require('express');
 const util = require('util');
-const { Readable } = require('stream');
 const { readSecret, SECRET_KEYS } = require('./secrets');
-const { readAllChunks, extractFileFromZipBuffer } = require('../util');
+const { readAllChunks, extractFileFromZipBuffer, forwardFetchResponse } = require('../util');
 const { jsonParser } = require('../express-common');
 
 const API_NOVELAI = 'https://api.novelai.net';
@@ -11,7 +10,7 @@ const API_NOVELAI = 'https://api.novelai.net';
 // Ban bracket generation, plus defaults
 const badWordsList = [
     [3], [49356], [1431], [31715], [34387], [20765], [30702], [10691], [49333], [1266],
-    [19438], [43145], [26523], [41471], [2936], [85, 85], [49332], [7286], [1115],
+    [19438], [43145], [26523], [41471], [2936], [85, 85], [49332], [7286], [1115], [24],
 ];
 
 const hypeBotBadWordsList = [
@@ -173,8 +172,16 @@ router.post('/generate', jsonParser, async function (req, res) {
             'return_full_text': req.body.return_full_text,
             'prefix': req.body.prefix,
             'order': req.body.order,
+            'num_logprobs': req.body.num_logprobs,
         },
     };
+
+    // Tells the model to stop generation at '>'
+    if ('theme_textadventure' === req.body.prefix &&
+        (true === req.body.model.includes('clio') ||
+         true === req.body.model.includes('kayra'))) {
+        data.parameters.eos_token_id = 49405;
+    }
 
     console.log(util.inspect(data, { depth: 4 }));
 
@@ -190,17 +197,7 @@ router.post('/generate', jsonParser, async function (req, res) {
 
         if (req.body.streaming) {
             // Pipe remote SSE stream to Express response
-            response.body.pipe(res);
-
-            req.socket.on('close', function () {
-                if (response.body instanceof Readable) response.body.destroy(); // Close the remote stream
-                res.end(); // End the Express response
-            });
-
-            response.body.on('end', function () {
-                console.log('Streaming request finished');
-                res.end();
-            });
+            forwardFetchResponse(response, res);
         } else {
             if (!response.ok) {
                 const text = await response.text();
@@ -219,7 +216,7 @@ router.post('/generate', jsonParser, async function (req, res) {
             }
 
             const data = await response.json();
-            console.log(data);
+            console.log('NovelAI Output', data?.output);
             return res.send(data);
         }
     } catch (error) {
@@ -353,7 +350,9 @@ router.post('/generate-voice', jsonParser, async (request, response) => {
         });
 
         if (!result.ok) {
-            return response.sendStatus(result.status);
+            const errorText = await result.text();
+            console.log('NovelAI returned an error.', result.statusText, errorText);
+            return response.sendStatus(500);
         }
 
         const chunks = await readAllChunks(result.body);

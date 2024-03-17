@@ -4,9 +4,11 @@ const express = require('express');
 const { SentencePieceProcessor } = require('@agnai/sentencepiece-js');
 const tiktoken = require('@dqbd/tiktoken');
 const { Tokenizer } = require('@agnai/web-tokenizers');
-const { convertClaudePrompt } = require('../chat-completion');
+const { convertClaudePrompt, convertGooglePrompt } = require('./prompt-converters');
 const { readSecret, SECRET_KEYS } = require('./secrets');
+const { TEXTGEN_TYPES } = require('../constants');
 const { jsonParser } = require('../express-common');
+const { setAdditionalHeaders } = require('../additional-headers');
 
 /**
  * @type {{[key: string]: import("@dqbd/tiktoken").Tiktoken}} Tokenizers cache
@@ -247,6 +249,7 @@ async function loadClaudeTokenizer(modelPath) {
 }
 
 function countClaudeTokens(tokenizer, messages) {
+    // Should be fine if we use the old conversion method instead of the messages API one i think?
     const convertedPrompt = convertClaudePrompt(messages, false, false, false);
 
     // Fallback to strlen estimation
@@ -296,11 +299,13 @@ function createSentencepieceDecodingHandler(tokenizer) {
 
             const ids = request.body.ids || [];
             const instance = await tokenizer?.get();
-            const text = await instance?.decodeIds(ids);
-            return response.send({ text });
+            const ops = ids.map(id => instance.decodeIds([id]));
+            const chunks = await Promise.all(ops);
+            const text = chunks.join('');
+            return response.send({ text, chunks });
         } catch (error) {
             console.log(error);
-            return response.send({ text: '' });
+            return response.send({ text: '', chunks: [] });
         }
     };
 }
@@ -379,6 +384,26 @@ router.post('/ai21/count', jsonParser, async function (req, res) {
         const response = await fetch('https://api.ai21.com/studio/v1/tokenize', options);
         const data = await response.json();
         return res.send({ 'token_count': data?.tokens?.length || 0 });
+    } catch (err) {
+        console.error(err);
+        return res.send({ 'token_count': 0 });
+    }
+});
+
+router.post('/google/count', jsonParser, async function (req, res) {
+    if (!req.body) return res.sendStatus(400);
+    const options = {
+        method: 'POST',
+        headers: {
+            accept: 'application/json',
+            'content-type': 'application/json',
+        },
+        body: JSON.stringify({ contents: convertGooglePrompt(req.body) }),
+    };
+    try {
+        const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${req.query.model}:countTokens?key=${readSecret(SECRET_KEYS.MAKERSUITE)}`, options);
+        const data = await response.json();
+        return res.send({ 'token_count': data?.totalTokens || 0 });
     } catch (err) {
         console.error(err);
         return res.send({ 'token_count': 0 });
@@ -531,6 +556,105 @@ router.post('/openai/count', jsonParser, async function (req, res) {
         const jsonBody = JSON.stringify(req.body);
         const num_tokens = Math.ceil(jsonBody.length / CHARS_PER_TOKEN);
         res.send({ 'token_count': num_tokens });
+    }
+});
+
+router.post('/remote/kobold/count', jsonParser, async function (request, response) {
+    if (!request.body) {
+        return response.sendStatus(400);
+    }
+    const text = String(request.body.text) || '';
+    const baseUrl = String(request.body.url);
+
+    try {
+        const args = {
+            method: 'POST',
+            body: JSON.stringify({ 'prompt': text }),
+            headers: { 'Content-Type': 'application/json' },
+        };
+
+        let url = String(baseUrl).replace(/\/$/, '');
+        url += '/extra/tokencount';
+
+        const result = await fetch(url, args);
+
+        if (!result.ok) {
+            console.log(`API returned error: ${result.status} ${result.statusText}`);
+            return response.send({ error: true });
+        }
+
+        const data = await result.json();
+        const count = data['value'];
+        const ids = data['ids'] ?? [];
+        return response.send({ count, ids });
+    } catch (error) {
+        console.log(error);
+        return response.send({ error: true });
+    }
+});
+
+router.post('/remote/textgenerationwebui/encode', jsonParser, async function (request, response) {
+    if (!request.body) {
+        return response.sendStatus(400);
+    }
+    const text = String(request.body.text) || '';
+    const baseUrl = String(request.body.url);
+    const legacyApi = Boolean(request.body.legacy_api);
+
+    try {
+        const args = {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+        };
+
+        setAdditionalHeaders(request, args, baseUrl);
+
+        // Convert to string + remove trailing slash + /v1 suffix
+        let url = String(baseUrl).replace(/\/$/, '').replace(/\/v1$/, '');
+
+        if (legacyApi) {
+            url += '/v1/token-count';
+            args.body = JSON.stringify({ 'prompt': text });
+        } else {
+            switch (request.body.api_type) {
+                case TEXTGEN_TYPES.TABBY:
+                    url += '/v1/token/encode';
+                    args.body = JSON.stringify({ 'text': text });
+                    break;
+                case TEXTGEN_TYPES.KOBOLDCPP:
+                    url += '/api/extra/tokencount';
+                    args.body = JSON.stringify({ 'prompt': text });
+                    break;
+                case TEXTGEN_TYPES.LLAMACPP:
+                    url += '/tokenize';
+                    args.body = JSON.stringify({ 'content': text });
+                    break;
+                case TEXTGEN_TYPES.APHRODITE:
+                    url += '/v1/tokenize';
+                    args.body = JSON.stringify({ 'prompt': text });
+                    break;
+                default:
+                    url += '/v1/internal/encode';
+                    args.body = JSON.stringify({ 'text': text });
+                    break;
+            }
+        }
+
+        const result = await fetch(url, args);
+
+        if (!result.ok) {
+            console.log(`API returned error: ${result.status} ${result.statusText}`);
+            return response.send({ error: true });
+        }
+
+        const data = await result.json();
+        const count = legacyApi ? data?.results[0]?.tokens : (data?.length ?? data?.value ?? data?.tokens?.length);
+        const ids = legacyApi ? [] : (data?.tokens ?? data?.ids ?? []);
+
+        return response.send({ count, ids });
+    } catch (error) {
+        console.log(error);
+        return response.send({ error: true });
     }
 });
 
